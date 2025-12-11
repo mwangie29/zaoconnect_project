@@ -1,0 +1,9 @@
+name: zaoconnect
+
+services:
+  app:
+    build:
+      context: ./zaoproject
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
