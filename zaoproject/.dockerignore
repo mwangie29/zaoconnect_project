@@ -27,3 +27,4 @@ defang.exe
 .defang*
 
 **/myenv
+db.sqlite3
