@@ -1397,11 +1397,13 @@
                 <form
                   id="search-form"
                   class="text-center"
-                  action="index.html"
+                  action="{% url 'find_product_by_name' %}"
                   method="post"
                 >
+                  {% csrf_token %}
                   <input
                     type="text"
+                    name="name"
                     class="form-control border-0 bg-transparent"
                     placeholder="Search for more than 20,000 products"
                   />
@@ -1438,16 +1440,21 @@
              
              {% if user.is_authenticated %}
                 <li class="nav-item">
-                <a href="{% url 'profile' %}" class="nav-link">Profile</a>
-              </li>
-              {% if user.is_staff %}
-              <li class="nav-item">
-                <a href="{% url 'product_admin_list' %}" class="nav-link">Admin</a>
-              </li>
-              {% endif %}
-               <li class="nav-item">
-                <a href="{% url 'logout' %}" class="nav-link">LogOut</a>
-              </li>
+                  <a href="{% url 'profile' %}" class="nav-link">Profile</a>
+                </li>
+                {% if user.userprofile.is_seller %}
+                <li class="nav-item">
+                  <a href="{% url 'product_admin_list' %}" class="nav-link">My Products</a>
+                </li>
+                {% endif %}
+                {% if user.is_staff %}
+                <li class="nav-item">
+                  <a href="{% url 'admin_dashboard' %}" class="nav-link">Admin</a>
+                </li>
+                {% endif %}
+                <li class="nav-item">
+                  <a href="{% url 'logout' %}" class="nav-link">LogOut</a>
+                </li>
               {% else %}
                <li class="nav-item">
                 <a href="{% url 'register' %}" class="nav-link">Register</a>
@@ -1474,14 +1481,11 @@
                   aria-labelledby="pages"
                 >
                   <li>
-                    <a href="index.html" class="dropdown-item">About Us </a>
-                  </li>
-                  <li>
                     <a href="{% url 'index' %}#best-selling-products" class="dropdown-item">Shop </a>
                   </li>
-                  <li><a href="index.html" class="dropdown-item">Cart </a></li>
+                  <li><a href="{% url 'cart' %}" class="dropdown-item">Cart </a></li>
                   <li>
-                    <a href="index.html" class="dropdown-item">Checkout </a>
+                    <a href="{% url 'order' %}" class="dropdown-item">Checkout </a>
                   </li>
                   <li>
                     <a href="{% url 'profile' %}" class="dropdown-item">My Account </a>
@@ -1721,7 +1725,7 @@
         const sidebarCount = document.getElementById('cart-sidebar-count');
         const sidebarItems = document.getElementById('cart-sidebar-items');
         const sidebarTotal = document.getElementById('cart-sidebar-total');
-        const isUserAuthenticated = {% if user.is_authenticated %}'true'{% else %}'false'{% endif %};
+        const isUserAuthenticated = '{{ user.is_authenticated|yesno:"true,false" }}';
 
         // Get CSRF token from cookie
         function getCsrfToken() {

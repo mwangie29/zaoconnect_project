@@ -1,17 +1,60 @@
+from functools import wraps
+
 from django.contrib import messages
 from django.contrib.admin.views.decorators import staff_member_required
 from django.contrib.auth import login, logout
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import AuthenticationForm
+from django.contrib.auth.models import User
+from django.http import HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
-from django.http import JsonResponse
+from django.urls import reverse
 
-from .forms import ProductForm, Registerform, UserProfileForm, CustomPasswordChangeForm
-from .models import Contact, Product, Cart, CartItem
+from .forms import (
+    CustomPasswordChangeForm,
+    ForgotPasswordForm,
+    ProductForm,
+    Registerform,
+    ResetPasswordForm,
+    UserProfileForm,
+)
+from .models import Cart, CartItem, Contact, Product, UserProfile
+from django.db.models import Count
+from django.db.models.functions import TruncDate
+from django.utils import timezone
 from io import BytesIO
-from django.http import HttpResponse
 from datetime import datetime
 import json
+import secrets
+
+
+def seller_required(view_func):
+    """
+    Decorator to allow access only to authenticated users who are registered as Sellers.
+
+    - If the user is not authenticated, they are redirected to the login page.
+    - If the user is authenticated but not a Seller, they are redirected to the homepage
+      with an error message.
+    """
+
+    @wraps(view_func)
+    def _wrapped_view(request, *args, **kwargs):
+        if not request.user.is_authenticated:
+            login_url = reverse("login")
+            return redirect(f"{login_url}?next={request.path}")
+
+        try:
+            profile: UserProfile = request.user.userprofile
+        except UserProfile.DoesNotExist:
+            profile = None
+
+        if not profile or not profile.is_seller:
+            messages.error(request, "You must be registered as a Seller to access this page.")
+            return redirect("index")
+
+        return view_func(request, *args, **kwargs)
+
+    return _wrapped_view
 
 
 @staff_member_required
@@ -107,7 +150,14 @@ def register(request):
     if request.method == 'POST':
         form = Registerform(request.POST)
         if form.is_valid():
-            form.save()
+            user = form.save()
+
+            # Set the user's role via their UserProfile
+            role = form.cleaned_data.get("role", "buyer")
+            profile, _ = UserProfile.objects.get_or_create(user=user)
+            profile.is_seller = role == "seller"
+            profile.save()
+
             messages.success(request, 'Account created successfully. You can now log in.')
             return redirect('index')
     else:
@@ -121,6 +171,9 @@ def user_login(request):
         if form.is_valid():
             user = form.get_user()
             login(request, user)
+            next_url = request.GET.get('next') or request.POST.get('next')
+            if next_url:
+                return redirect(next_url)
             return redirect('index')
     else:
         form = AuthenticationForm()
@@ -131,11 +184,12 @@ def user_login(request):
 def profile(request):
     """User profile page with edit form and password change."""
     user = request.user
+    user_profile = getattr(user, "userprofile", None)
     profile_form = None
     password_form = None
     profile_updated = False
     password_updated = False
-    
+
     # Handle profile form submission
     if request.method == 'POST' and 'update_profile' in request.POST:
         profile_form = UserProfileForm(request.POST, instance=user)
@@ -159,10 +213,11 @@ def profile(request):
     else:
         profile_form = UserProfileForm(instance=user)
         password_form = CustomPasswordChangeForm(user)
-    
+
     context = {
         'profile_form': profile_form,
         'password_form': password_form,
+        'user_profile': user_profile,
     }
     return render(request, 'profile.html', context)
 
@@ -171,28 +226,32 @@ def logout_user(request):
     logout(request)
     return redirect('index')
 
-@staff_member_required
+@seller_required
 def product_admin_list(request):
-    products = Product.objects.all()
-    return render(request, 'admin/products_list.html', {'products': products})
+    # Sellers can only see and manage their own products
+    products = Product.objects.filter(owner=request.user)
+    return render(request, 'seller/products_list.html', {'products': products})
 
 
-@staff_member_required
+@seller_required
 def product_create(request):
     if request.method == 'POST':
         form = ProductForm(request.POST, request.FILES)
         if form.is_valid():
-            form.save()
+            product = form.save(commit=False)
+            product.owner = request.user
+            product.save()
             messages.success(request, 'Product created successfully.')
             return redirect('product_admin_list')
     else:
         form = ProductForm()
-    return render(request, 'admin/product_form.html', {'form': form, 'action': 'Add'})
+    return render(request, 'seller/product_form.html', {'form': form, 'action': 'Add'})
 
 
-@staff_member_required
+@seller_required
 def product_update(request, pk):
-    product = get_object_or_404(Product, pk=pk)
+    # Only allow a seller to edit their own product
+    product = get_object_or_404(Product, pk=pk, owner=request.user)
     if request.method == 'POST':
         form = ProductForm(request.POST, request.FILES, instance=product)
         if form.is_valid():
@@ -201,17 +260,18 @@ def product_update(request, pk):
             return redirect('product_admin_list')
     else:
         form = ProductForm(instance=product)
-    return render(request, 'admin/product_form.html', {'form': form, 'action': 'Edit', 'product': product})
+    return render(request, 'seller/product_form.html', {'form': form, 'action': 'Edit', 'product': product})
 
 
-@staff_member_required
+@seller_required
 def product_delete(request, pk):
-    product = get_object_or_404(Product, pk=pk)
+    # Only allow a seller to delete their own product
+    product = get_object_or_404(Product, pk=pk, owner=request.user)
     if request.method == 'POST':
         product.delete()
         messages.success(request, 'Product deleted successfully.')
         return redirect('product_admin_list')
-    return render(request, 'admin/product_confirm_delete.html', {'product': product})
+    return render(request, 'seller/product_confirm_delete.html', {'product': product})
 
 
 @login_required
@@ -307,3 +367,312 @@ def find_product_by_name(request):
         return JsonResponse({'error': 'product not found'}, status=404)
 
     return JsonResponse({'id': product.id, 'name': product.name, 'price': float(product.price)})
+
+
+def forgot_password(request):
+    """Handle forgot password request - verify email and generate reset token."""
+    if request.method == 'POST':
+        from .forms import ForgotPasswordForm
+        form = ForgotPasswordForm(request.POST)
+        if form.is_valid():
+            email = form.cleaned_data['email']
+            user = User.objects.get(email=email)
+            
+            # Generate a simple reset token (in production, use django-rest-auth or similar)
+            import secrets
+            token = secrets.token_urlsafe(32)
+            
+            # Store token temporarily in session (better: use token model or cache)
+            request.session[f'reset_token_{user.id}'] = token
+            request.session[f'reset_token_{user.id}_created'] = str(datetime.now())
+            
+            messages.success(request, f'Reset link has been sent to {email}. Please check your email.')
+            return redirect('reset_password', user_id=user.id, token=token)
+    else:
+        from .forms import ForgotPasswordForm
+        form = ForgotPasswordForm()
+    
+    return render(request, 'forgot_password.html', {'form': form})
+
+
+def reset_password(request, user_id, token):
+    """Handle password reset with token verification."""
+    from django.contrib.auth.models import User
+    
+    try:
+        user = User.objects.get(id=user_id)
+    except User.DoesNotExist:
+        messages.error(request, 'Invalid reset link.')
+        return redirect('login')
+    
+    # Verify token from session
+    stored_token = request.session.get(f'reset_token_{user_id}')
+    if stored_token != token:
+        messages.error(request, 'Invalid or expired reset link.')
+        return redirect('login')
+    
+    if request.method == 'POST':
+        from .forms import ResetPasswordForm
+        form = ResetPasswordForm(request.POST)
+        if form.is_valid():
+            new_password = form.cleaned_data['new_password']
+            user.set_password(new_password)
+            user.save()
+            
+            # Clear token from session
+            del request.session[f'reset_token_{user_id}']
+            if f'reset_token_{user_id}_created' in request.session:
+                del request.session[f'reset_token_{user_id}_created']
+            
+            messages.success(request, 'Password has been reset successfully. Please login with your new password.')
+            return redirect('login')
+    else:
+        from .forms import ResetPasswordForm
+        form = ResetPasswordForm()
+    
+    return render(request, 'reset_password.html', {'form': form, 'user': user})
+
+
+@staff_member_required
+def admin_dashboard(request):
+    """
+    Custom admin dashboard showing an overview of all user accounts and their carts,
+    plus simple growth analytics for registrations and cart activity.
+    """
+    users = User.objects.all().select_related('userprofile').order_by('-date_joined')
+
+    # High‑level metrics
+    today = timezone.now().date()
+    last_7 = today - timezone.timedelta(days=6)
+    last_30 = today - timezone.timedelta(days=29)
+
+    total_users = users.count()
+    total_sellers = users.filter(userprofile__is_seller=True).count()
+    total_buyers = total_users - total_sellers
+
+    new_last_7 = users.filter(date_joined__date__gte=last_7).count()
+    new_last_30 = users.filter(date_joined__date__gte=last_30).count()
+
+    users_with_cart_items = (
+        User.objects.filter(cart__items__isnull=False).distinct().count()
+    )
+    cart_users_last_7 = (
+        User.objects.filter(
+            cart__items__created_at__date__gte=last_7
+        )
+        .distinct()
+        .count()
+    )
+
+    # Time‑series: registrations per day
+    registration_series = (
+        users.annotate(day=TruncDate('date_joined'))
+        .values('day')
+        .annotate(count=Count('id'))
+        .order_by('day')
+    )
+
+    # Time‑series: users who added items to cart per day
+    cart_series = (
+        CartItem.objects.annotate(day=TruncDate('created_at'))
+        .values('day')
+        .annotate(count=Count('cart__user', distinct=True))
+        .order_by('day')
+    )
+
+    # Per‑user overview rows used by the table
+    user_rows = []
+    for u in users:
+        profile = getattr(u, 'userprofile', None)
+        cart = getattr(u, 'cart', None)
+        user_rows.append(
+            {
+                'user': u,
+                'role': 'Seller' if profile and profile.is_seller else 'Buyer',
+                # Phone is stored in first_name as a simple contact field (see UserProfileForm comment).
+                'phone': u.first_name or '',
+                'cart_items_count': cart.items.count() if cart else 0,
+            }
+        )
+
+    context = {
+        'metrics': {
+            'total_users': total_users,
+            'total_sellers': total_sellers,
+            'total_buyers': total_buyers,
+            'new_last_7_days': new_last_7,
+            'new_last_30_days': new_last_30,
+            'users_with_cart_items': users_with_cart_items,
+            'cart_users_last_7_days': cart_users_last_7,
+        },
+        'registration_series': registration_series,
+        'cart_series': cart_series,
+        'user_rows': user_rows,
+    }
+    return render(request, 'admin/dashboard.html', context)
+
+
+@staff_member_required
+def admin_dashboard_report_pdf(request):
+    """
+    Generate a PDF snapshot of the admin dashboard metrics and user overview.
+    """
+    try:
+        from reportlab.lib.pagesizes import A4  # type: ignore
+        from reportlab.pdfgen import canvas  # type: ignore
+    except Exception:
+        return HttpResponse(
+            "Report generation requires ReportLab. Install with: pip install reportlab",
+            status=500,
+            content_type="text/plain",
+        )
+
+    buffer = BytesIO()
+    page_size = A4
+    c = canvas.Canvas(buffer, pagesize=page_size)
+    width, height = page_size
+
+    # Reuse same metrics as admin_dashboard
+    users = User.objects.all().select_related('userprofile')
+    today = timezone.now().date()
+    last_7 = today - timezone.timedelta(days=6)
+    last_30 = today - timezone.timedelta(days=29)
+
+    total_users = users.count()
+    total_sellers = users.filter(userprofile__is_seller=True).count()
+    total_buyers = total_users - total_sellers
+    new_last_7 = users.filter(date_joined__date__gte=last_7).count()
+    new_last_30 = users.filter(date_joined__date__gte=last_30).count()
+    users_with_cart_items = (
+        User.objects.filter(cart__items__isnull=False).distinct().count()
+    )
+    cart_users_last_7 = (
+        User.objects.filter(cart__items__created_at__date__gte=last_7)
+        .distinct()
+        .count()
+    )
+
+    # Header
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(40, height - 50, "Admin Dashboard Report")
+    c.setFont("Helvetica", 10)
+    c.drawString(
+        40,
+        height - 70,
+        f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
+    )
+
+    y = height - 100
+
+    # Summary metrics
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(40, y, "Summary")
+    y -= 18
+    c.setFont("Helvetica", 10)
+    lines = [
+        f"Total users: {total_users} (Sellers: {total_sellers}, Buyers: {total_buyers})",
+        f"New users (last 7 days): {new_last_7}",
+        f"New users (last 30 days): {new_last_30}",
+        f"Users with items in cart: {users_with_cart_items}",
+        f"Users adding to cart in last 7 days: {cart_users_last_7}",
+    ]
+    for line in lines:
+        c.drawString(40, y, line)
+        y -= 14
+
+    # Users table (basic)
+    y -= 10
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(40, y, "Users")
+    y -= 18
+    c.setFont("Helvetica-Bold", 9)
+    c.drawString(40, y, "Username")
+    c.drawString(180, y, "Email")
+    c.drawString(360, y, "Role")
+    c.drawString(420, y, "Joined")
+    y -= 14
+    c.setFont("Helvetica", 9)
+
+    for u in users.order_by("-date_joined"):
+        if y < 60:
+            c.showPage()
+            y = height - 50
+            c.setFont("Helvetica-Bold", 9)
+            c.drawString(40, y, "Username")
+            c.drawString(180, y, "Email")
+            c.drawString(360, y, "Role")
+            c.drawString(420, y, "Joined")
+            y -= 14
+            c.setFont("Helvetica", 9)
+
+        profile = getattr(u, "userprofile", None)
+        role = "Seller" if profile and profile.is_seller else "Buyer"
+        c.drawString(40, y, (u.username or "")[:18])
+        c.drawString(180, y, (u.email or "")[:25])
+        c.drawString(360, y, role)
+        c.drawString(
+            420,
+            y,
+            u.date_joined.strftime("%Y-%m-%d"),
+        )
+        y -= 12
+
+    c.showPage()
+    c.save()
+    pdf = buffer.getvalue()
+    buffer.close()
+
+    resp = HttpResponse(pdf, content_type="application/pdf")
+    resp["Content-Disposition"] = 'attachment; filename="admin_dashboard_report.pdf"'
+    return resp
+
+
+@staff_member_required
+def admin_user_detail(request, user_id: int):
+    """
+    Show detailed information for a single user, including:
+    - Basic account info
+    - Role (Buyer/Seller)
+    - Contact number
+    - Cart items and totals
+    """
+    user = get_object_or_404(User, pk=user_id)
+    profile = getattr(user, 'userprofile', None)
+    cart = getattr(user, 'cart', None)
+
+    items = []
+    if cart:
+        items = cart.items.select_related('product').all()
+
+    context = {
+        'obj_user': user,
+        'profile': profile,
+        'phone': user.first_name or '',
+        'cart': cart,
+        'items': items,
+    }
+    return render(request, 'admin/user_detail.html', context)
+
+
+@staff_member_required
+def admin_reset_user_password(request, user_id: int):
+    """
+    Reset a user's password to a new temporary value.
+
+    The new password is shown once on the confirmation page so it can be
+    communicated securely to the account owner.
+    """
+    user = get_object_or_404(User, pk=user_id)
+
+    if request.method == 'POST':
+        new_password = secrets.token_urlsafe(8)
+        user.set_password(new_password)
+        user.save()
+        messages.success(
+            request,
+            f"Password for {user.username} has been reset. "
+            f"Temporary password: {new_password}",
+        )
+        return redirect('admin_user_detail', user_id=user.id)
+
+    return render(request, 'admin/reset_user_password_confirm.html', {'obj_user': user})

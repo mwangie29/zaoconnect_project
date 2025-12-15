@@ -1,6 +1,19 @@
 from django.db import models
 from django.contrib.auth.models import User
 
+
+class UserProfile(models.Model):
+    """Extended profile for each user to store their role and optional seller info."""
+
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="userprofile")
+    # True means this user is a Seller; False means they are a Buyer
+    is_seller = models.BooleanField(default=False)
+    farm_name = models.CharField(max_length=100, blank=True, null=True)
+
+    def __str__(self) -> str:  # pragma: no cover - simple representation
+        role = "Seller" if self.is_seller else "Buyer"
+        return f"{self.user.username} ({role})"
+
 class Contact(models.Model):
     name = models.CharField(max_length=100)
     email = models.EmailField()
@@ -12,6 +25,7 @@ class Contact(models.Model):
 
 
 class Product(models.Model):
+    owner = models.ForeignKey(User, on_delete=models.CASCADE, related_name='products', null=True, blank=True)
     name = models.CharField(max_length=150, unique=True)
     description = models.TextField(blank=True)
     price = models.DecimalField(max_digits=10, decimal_places=2)
