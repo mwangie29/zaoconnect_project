@@ -1463,33 +1463,7 @@
                 <a href="{% url 'login' %}" class="nav-link">Login</a>
               </li>
               
-
               {% endif %}
-
-              <!--Dropdown from the navbar-->
-              <li class="nav-item dropdown">
-                <a
-                  class="nav-link dropdown-toggle pe-3"
-                  role="button"
-                  id="pages"
-                  data-bs-toggle="dropdown"
-                  aria-expanded="false"
-                  >Pages</a
-                >
-                <ul
-                  class="dropdown-menu border-0 p-3 rounded-0 shadow"
-                  aria-labelledby="pages"
-                >
-                  <li>
-                    <a href="{% url 'index' %}#best-selling-products" class="dropdown-item">Shop </a>
-                  </li>
-                  <li><a href="{% url 'cart' %}" class="dropdown-item">Cart </a></li>
-                  <li>
-                    <a href="{% url 'order' %}" class="dropdown-item">Checkout </a>
-                  </li>
-                  <li>
-                    <a href="{% url 'profile' %}" class="dropdown-item">My Account </a>
-                  </li>
                 </ul>
               </li>
             </ul>

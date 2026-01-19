@@ -1,0 +1,159 @@
+{% extends 'admin/base_admin.html' %}
+
+{% block content %}
+<section class="py-5">
+  <div class="container">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+      <div>
+        <p class="text-uppercase text-muted small mb-1">Admin</p>
+        <h1 class="h3 mb-0">Project Overview</h1>
+      </div>
+      <div>
+        <a
+          href="{% url 'admin_dashboard_report_pdf' %}"
+          class="btn btn-outline-primary btn-sm"
+          target="_blank"
+        >
+          Generate PDF Report
+        </a>
+      </div>
+    </div>
+
+    <!-- High-level growth metrics -->
+    <div class="row g-3 mb-4">
+      <div class="col-6 col-md-3">
+        <div class="card border-0 shadow-sm h-100">
+          <div class="card-body py-3">
+            <p class="text-muted text-uppercase small mb-1">Total Users</p>
+            <h2 class="h4 mb-0">{{ metrics.total_users }}</h2>
+          </div>
+        </div>
+      </div>
+      <div class="col-6 col-md-3">
+        <div class="card border-0 shadow-sm h-100">
+          <div class="card-body py-3">
+            <p class="text-muted text-uppercase small mb-1">Sellers</p>
+            <h2 class="h4 mb-0">{{ metrics.total_sellers }}</h2>
+            <p class="small text-muted mb-0">Buyers: {{ metrics.total_buyers }}</p>
+          </div>
+        </div>
+      </div>
+      <div class="col-6 col-md-3">
+        <div class="card border-0 shadow-sm h-100">
+          <div class="card-body py-3">
+            <p class="text-muted text-uppercase small mb-1">New (last 7 days)</p>
+            <h2 class="h4 mb-0">{{ metrics.new_last_7_days }}</h2>
+            <p class="small text-muted mb-0">Last 30 days: {{ metrics.new_last_30_days }}</p>
+          </div>
+        </div>
+      </div>
+      <div class="col-6 col-md-3">
+        <div class="card border-0 shadow-sm h-100">
+          <div class="card-body py-3">
+            <p class="text-muted text-uppercase small mb-1">Users with Cart Items</p>
+            <h2 class="h4 mb-0">{{ metrics.users_with_cart_items }}</h2>
+            <p class="small text-muted mb-0">Active (last 7 days): {{ metrics.cart_users_last_7_days }}</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    {% if messages %}
+      <div class="mb-3">
+        {% for message in messages %}
+          <div class="alert alert-{{ message.tags|default:'info' }} mb-2" role="alert">
+            {{ message }}
+          </div>
+        {% endfor %}
+      </div>
+    {% endif %}
+
+    <!-- Registration growth over time -->
+    <div class="card border-0 shadow-sm mb-4">
+      <div class="card-body">
+        <h2 class="h5 mb-3">Registrations Over Time</h2>
+        {% if registration_series %}
+          <div class="table-responsive">
+            <table class="table table-sm align-middle mb-0">
+              <thead>
+                <tr>
+                  <th scope="col">Date</th>
+                  <th scope="col">New Users</th>
+                  <th scope="col">Users Adding to Cart</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for row in registration_series %}
+                  <tr>
+                    <td>{{ row.day|date:"Y-m-d" }}</td>
+                    <td>{{ row.count }}</td>
+                    <td>
+                      {% for cart_row in cart_series %}
+                        {% if cart_row.day == row.day %}
+                          {{ cart_row.count }}
+                        {% endif %}
+                      {% endfor %}
+                    </td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% else %}
+          <p class="text-muted mb-0">No registration data yet.</p>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- Detailed list of all registered accounts -->
+    <div class="card border-0 shadow-sm mb-4">
+      <div class="card-body">
+        <h2 class="h5 mb-3">Registered Accounts</h2>
+        <div class="table-responsive">
+          <table class="table table-striped align-middle mb-0">
+            <thead>
+              <tr>
+                <th scope="col">Username</th>
+                <th scope="col">Email</th>
+                <th scope="col">Role</th>
+                <th scope="col">Contact Number</th>
+                <th scope="col">Date Joined</th>
+                <th scope="col" class="text-center">Cart Items</th>
+                <th scope="col" class="text-end">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in user_rows %}
+                <tr>
+                  <td>{{ row.user.username }}</td>
+                  <td>{{ row.user.email }}</td>
+                  <td>{{ row.role }}</td>
+                  <td>{{ row.phone|default:"—" }}</td>
+                  <td>{{ row.user.date_joined|date:"Y-m-d H:i" }}</td>
+                  <td class="text-center">{{ row.cart_items_count }}</td>
+                  <td class="text-end">
+                    <a
+                      href="{% url 'admin_user_detail' row.user.id %}"
+                      class="btn btn-sm btn-outline-primary"
+                    >
+                      View
+                    </a>
+                  </td>
+                </tr>
+              {% empty %}
+                <tr>
+                  <td colspan="7" class="text-center py-4 text-muted">
+                    No users found.
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+{% endblock content %}
+
+

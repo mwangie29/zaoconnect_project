@@ -57,3 +57,5 @@ htmlcov/
 # Node (if using npm for frontend)
 node_modules/
 npm-debug.log
+
+.config/
