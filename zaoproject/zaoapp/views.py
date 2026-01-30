@@ -1,15 +1,31 @@
+import json
+import logging
+import secrets
+from datetime import datetime, timedelta
 from functools import wraps
+from io import BytesIO
 
+from django.conf import settings
 from django.contrib import messages
 from django.contrib.admin.views.decorators import staff_member_required
 from django.contrib.auth import login, logout
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import AuthenticationForm
 from django.contrib.auth.models import User
+from django.db.models import Count, Sum, Avg, Q
+from django.db.models.functions import TruncDate
 from django.http import HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
+from django.utils import timezone
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_http_methods
 
+from .email_notifications import (
+    send_payment_success_email,
+    send_payment_failed_email,
+    send_admin_payment_notification,
+)
 from .forms import (
     CustomPasswordChangeForm,
     ForgotPasswordForm,
@@ -17,15 +33,20 @@ from .forms import (
     Registerform,
     ResetPasswordForm,
     UserProfileForm,
+    VerifyResetCodeForm,
 )
-from .models import Cart, CartItem, Contact, Product, UserProfile
-from django.db.models import Count
-from django.db.models.functions import TruncDate
-from django.utils import timezone
-from io import BytesIO
-from datetime import datetime
-import json
-import secrets
+from .models import Cart, CartItem, Contact, Order, Product, UserProfile
+from .mpesa import stk_push
+from .constants import (
+    SUCCESS_MESSAGES,
+    ERROR_MESSAGES,
+    OrderStatus,
+    UserRole,
+    Validation,
+    MPesa,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def seller_required(view_func):
@@ -49,7 +70,7 @@ def seller_required(view_func):
             profile = None
 
         if not profile or not profile.is_seller:
-            messages.error(request, "You must be registered as a Seller to access this page.")
+            messages.error(request, ERROR_MESSAGES['SELLER_REQUIRED'])
             return redirect("index")
 
         return view_func(request, *args, **kwargs)
@@ -122,10 +143,14 @@ def index(request):
     products = Product.objects.filter(is_active=True)
     return render(request, 'index.html', {'products': products})
 
+@login_required
 def cart(request):
+    """Cart page: requires login so cart is loaded from DB (persists across refresh and re-login)."""
     return render(request, 'cart.html')
 
+@login_required
 def order(request):
+    """Checkout/order page: cart from DB, payment methods (M-Pesa STK Push)."""
     return render(request, 'order.html')
 
 def base(request):
@@ -140,9 +165,9 @@ def contact(request):
 
         if name and email and message:
             Contact.objects.create(name=name, email=email, message=message)
-            messages.success(request, 'Thanks for reaching out. We will get back to you soon.')
+            messages.success(request, SUCCESS_MESSAGES['CONTACT_MESSAGE_SENT'])
             return redirect('contact')
-        messages.error(request, 'All fields are required.')
+        messages.error(request, ERROR_MESSAGES['ALL_FIELDS_REQUIRED'])
     return render(request, 'contact.html')
 
 
@@ -158,7 +183,7 @@ def register(request):
             profile.is_seller = role == "seller"
             profile.save()
 
-            messages.success(request, 'Account created successfully. You can now log in.')
+            messages.success(request, SUCCESS_MESSAGES['ACCOUNT_CREATED'])
             return redirect('index')
     else:
         form = Registerform()
@@ -197,7 +222,7 @@ def profile(request):
             profile_form.save()
             # Store phone number in user's first_name as a workaround (no phone field on User)
             # Alternatively, extend User with a UserProfile model if needed
-            messages.success(request, 'Profile updated successfully.')
+            messages.success(request, SUCCESS_MESSAGES['PROFILE_UPDATED'])
             profile_updated = True
             return redirect('profile')
         password_form = CustomPasswordChangeForm(user)
@@ -206,7 +231,7 @@ def profile(request):
         password_form = CustomPasswordChangeForm(user, request.POST)
         if password_form.is_valid():
             password_form.save()
-            messages.success(request, 'Password changed successfully.')
+            messages.success(request, SUCCESS_MESSAGES['PASSWORD_CHANGED'])
             password_updated = True
             return redirect('profile')
         profile_form = UserProfileForm(instance=user)
@@ -274,20 +299,31 @@ def product_delete(request, pk):
     return render(request, 'seller/product_confirm_delete.html', {'product': product})
 
 
+def _product_image_url(request, product):
+    """Build absolute URL for product image (Product.image may be CharField path or ImageField)."""
+    if not product.image:
+        return None
+    if hasattr(product.image, 'url'):
+        return request.build_absolute_uri(product.image.url)
+    # CharField storing path relative to MEDIA_ROOT
+    path = (product.image if isinstance(product.image, str) else str(product.image)).lstrip('/')
+    return request.build_absolute_uri(settings.MEDIA_URL + path)
+
+
 @login_required
 def get_cart(request):
-    """Get the current user's cart as JSON."""
+    """Get the current user's cart as JSON. Cart is stored in DB so it persists across refresh and login."""
     user = request.user
     cart, created = Cart.objects.get_or_create(user=user)
     
     items = []
-    for item in cart.items.all():
+    for item in cart.items.select_related('product').all():
         items.append({
             'product_id': item.product.id,
             'name': item.product.name,
             'price': float(item.product.price),
             'quantity': item.quantity,
-            'image_url': item.product.image.url if item.product.image else None,
+            'image_url': _product_image_url(request, item.product),
         })
     
     return JsonResponse({
@@ -307,9 +343,11 @@ def update_cart(request):
         product_id = data.get('product_id')
         quantity = data.get('quantity', 1)
         
-        if not product_id or quantity < 1:
-            return JsonResponse({'error': 'Invalid product_id or quantity'}, status=400)
-        
+        if not product_id:
+            return JsonResponse({'error': 'product_id required'}, status=400)
+        if quantity < 0:
+            return JsonResponse({'error': 'Invalid quantity'}, status=400)
+
         product = get_object_or_404(Product, id=product_id)
         cart, created = Cart.objects.get_or_create(user=request.user)
         
@@ -347,6 +385,139 @@ def clear_cart(request):
     return JsonResponse({'success': True})
 
 
+# -----------------------------------------------------------------------------
+# Checkout / M-Pesa STK Push (Daraja API – credentials in settings)
+# -----------------------------------------------------------------------------
+
+@login_required
+@require_http_methods(["POST"])
+def initiate_stk_push(request):
+    """
+    Create an Order, initiate Daraja STK Push, return checkout_request_id for polling.
+    POST JSON: { "phone_number": "254712345678", "amount": 500 }
+    Phone must be 12 digits (254 + 9 digits). Amount in KES (integer).
+    """
+    try:
+        data = json.loads(request.body)
+        phone_number = (data.get("phone_number") or "").strip().replace(" ", "")
+        amount = data.get("amount")
+    except (json.JSONDecodeError, TypeError):
+        return JsonResponse({"success": False, "error": "Invalid JSON"}, status=400)
+
+    if not phone_number or len(phone_number) != 12 or not phone_number.isdigit():
+        return JsonResponse({"success": False, "error": "Phone must be 12 digits (e.g. 254712345678)"}, status=400)
+    if amount is None:
+        return JsonResponse({"success": False, "error": "amount required"}, status=400)
+    try:
+        amount = int(round(float(amount)))
+    except (TypeError, ValueError):
+        return JsonResponse({"success": False, "error": "Invalid amount"}, status=400)
+    if amount < 1:
+        return JsonResponse({"success": False, "error": "Amount must be at least 1 KES"}, status=400)
+
+    cart, _ = Cart.objects.get_or_create(user=request.user)
+    cart_total = float(cart.get_total())
+    if amount != int(round(cart_total)):
+        return JsonResponse({"success": False, "error": "Amount does not match cart total"}, status=400)
+
+    callback_host = getattr(settings, "MPESA_CALLBACK_HOST", "").rstrip("/")
+    if not callback_host:
+        callback_host = request.build_absolute_uri("/").rstrip("/")
+    callback_url = f"{callback_host}{reverse('mpesa_callback')}"
+
+    order_obj = Order.objects.create(
+        user=request.user,
+        total_amount=amount,
+        phone_number=phone_number,
+        status=Order.STATUS_PENDING,
+    )
+    result = stk_push(
+        phone_number=phone_number,
+        amount=amount,
+        account_reference=f"Zao{order_obj.id}",
+        callback_url=callback_url,
+    )
+    if not result["success"]:
+        order_obj.status = Order.STATUS_FAILED
+        order_obj.mpesa_response = result.get("error_message", "")
+        order_obj.save()
+        return JsonResponse({"success": False, "error": result.get("error_message", "STK push failed")}, status=502)
+    order_obj.checkout_request_id = result["checkout_request_id"]
+    order_obj.save()
+    return JsonResponse({
+        "success": True,
+        "checkout_request_id": result["checkout_request_id"],
+        "order_id": order_obj.id,
+    })
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def mpesa_callback(request):
+    """
+    Daraja calls this URL with the STK Push result. Must be publicly reachable (e.g. via ngrok).
+    """
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, TypeError):
+        return JsonResponse({"ResultCode": 1, "ResultDesc": "Invalid JSON"}, status=400)
+    
+    body_str = json.dumps(body)
+    result = body.get("Body", {}).get("stkCallback", {})
+    result_code = result.get("ResultCode")
+    checkout_request_id = (result.get("CheckoutRequestID") or "").strip()
+    
+    if not checkout_request_id:
+        return JsonResponse({"ResultCode": 0, "ResultDesc": "Accepted"})
+    
+    order_obj = Order.objects.filter(checkout_request_id=checkout_request_id).first()
+    if not order_obj:
+        return JsonResponse({"ResultCode": 0, "ResultDesc": "Accepted"})
+    
+    order_obj.mpesa_response = body_str
+    
+    if result_code == 0:
+        callback_metadata = result.get("CallbackMetadata", {}).get("Item", [])
+        receipt = ""
+        for item in callback_metadata:
+            if item.get("Name") == "MpesaReceiptNumber":
+                receipt = str(item.get("Value", ""))
+                break
+        
+        order_obj.mpesa_receipt_number = receipt
+        order_obj.status = Order.STATUS_PAID
+        order_obj.updated_at = timezone.now()
+        order_obj.save()
+        
+        # Send success emails
+        send_payment_success_email(order_obj)
+        send_admin_payment_notification(order_obj)
+        
+        logger.info(f"Payment successful for order {order_obj.id} with receipt {receipt}")
+    else:
+        order_obj.status = Order.STATUS_FAILED
+        order_obj.updated_at = timezone.now()
+        order_obj.save()
+        
+        # Send failure email
+        send_payment_failed_email(order_obj)
+        
+        logger.warning(f"Payment failed for order {order_obj.id} with result code {result_code}")
+    
+    return JsonResponse({"ResultCode": 0, "ResultDesc": "Accepted"})
+
+
+@login_required
+def payment_status(request, checkout_request_id):
+    """GET: return status of order for this checkout_request_id (for polling after Pay Now)."""
+    order_obj = get_object_or_404(Order, checkout_request_id=checkout_request_id, user=request.user)
+    return JsonResponse({
+        "status": order_obj.status,
+        "order_id": order_obj.id,
+        "receipt_number": order_obj.mpesa_receipt_number or "",
+    })
+
+
 def find_product_by_name(request):
     """Find a product by name (exact or partial match) and return id/price.
 
@@ -370,64 +541,128 @@ def find_product_by_name(request):
 
 
 def forgot_password(request):
-    """Handle forgot password request - verify email and generate reset token."""
+    """Handle forgot password request - send verification code to email."""
+    from django.core.mail import send_mail
+    from django.utils import timezone
+    from datetime import timedelta
+    from .models import PasswordResetToken
+    import random
+    
     if request.method == 'POST':
-        from .forms import ForgotPasswordForm
         form = ForgotPasswordForm(request.POST)
         if form.is_valid():
             email = form.cleaned_data['email']
             user = User.objects.get(email=email)
             
-            # Generate a simple reset token (in production, use django-rest-auth or similar)
-            import secrets
-            token = secrets.token_urlsafe(32)
+            # Generate 6-digit code
+            code = ''.join([str(random.randint(0, 9)) for _ in range(6)])
             
-            # Store token temporarily in session (better: use token model or cache)
-            request.session[f'reset_token_{user.id}'] = token
-            request.session[f'reset_token_{user.id}_created'] = str(datetime.now())
+            # Delete old tokens for this user
+            PasswordResetToken.objects.filter(user=user).delete()
             
-            messages.success(request, f'Reset link has been sent to {email}. Please check your email.')
-            return redirect('reset_password', user_id=user.id, token=token)
+            # Create new token record
+            expires_at = timezone.now() + timedelta(minutes=15)
+            reset_token = PasswordResetToken.objects.create(
+                user=user,
+                code=code,
+                expires_at=expires_at
+            )
+            
+            # Send email with code
+            try:
+                send_mail(
+                    subject='Password Reset Code - ZaoConnect',
+                    message=f'''Hello {user.first_name or user.username},
+
+You requested a password reset. Use this code to verify your identity:
+
+{code}
+
+This code will expire in 15 minutes.
+
+If you didn't request this, please ignore this email.
+
+Best regards,
+ZaoConnect Team''',
+                    from_email=settings.DEFAULT_FROM_EMAIL,
+                    recipient_list=[user.email],
+                    fail_silently=False,
+                )
+                messages.success(request, f'Verification code sent to {email}. Check your email.')
+                return redirect('verify_reset_code', user_id=user.id)
+            except Exception as e:
+                messages.error(request, f'Error sending email. Please try again. {str(e)}')
     else:
-        from .forms import ForgotPasswordForm
         form = ForgotPasswordForm()
     
     return render(request, 'forgot_password.html', {'form': form})
 
 
-def reset_password(request, user_id, token):
-    """Handle password reset with token verification."""
-    from django.contrib.auth.models import User
+def verify_reset_code(request, user_id):
+    """Verify the reset code sent to user's email."""
+    from .models import PasswordResetToken
     
     try:
         user = User.objects.get(id=user_id)
     except User.DoesNotExist:
-        messages.error(request, 'Invalid reset link.')
+        messages.error(request, 'Invalid request.')
         return redirect('login')
     
-    # Verify token from session
-    stored_token = request.session.get(f'reset_token_{user_id}')
-    if stored_token != token:
-        messages.error(request, 'Invalid or expired reset link.')
-        return redirect('login')
+    # Get the latest reset token for this user
+    reset_token = PasswordResetToken.objects.filter(user=user, is_verified=False).latest('created_at')
+    
+    if not reset_token or reset_token.is_expired():
+        messages.error(request, 'Verification code has expired. Please try again.')
+        return redirect('forgot_password')
     
     if request.method == 'POST':
-        from .forms import ResetPasswordForm
+        form = VerifyResetCodeForm(request.POST)
+        if form.is_valid():
+            code = form.cleaned_data['code']
+            
+            if reset_token.code == code:
+                # Mark token as verified
+                reset_token.is_verified = True
+                reset_token.save()
+                
+                messages.success(request, 'Code verified successfully. Please set your new password.')
+                return redirect('reset_password', user_id=user.id, token_id=reset_token.id)
+            else:
+                messages.error(request, 'Invalid verification code. Please try again.')
+    else:
+        form = VerifyResetCodeForm()
+    
+    return render(request, 'verify_reset_code.html', {'form': form, 'user': user})
+
+
+def reset_password(request, user_id, token_id):
+    """Handle password reset after verification."""
+    from .models import PasswordResetToken
+    
+    try:
+        user = User.objects.get(id=user_id)
+        reset_token = PasswordResetToken.objects.get(id=token_id, user=user, is_verified=True)
+    except (User.DoesNotExist, PasswordResetToken.DoesNotExist):
+        messages.error(request, 'Invalid request.')
+        return redirect('login')
+    
+    if reset_token.is_expired():
+        messages.error(request, 'Reset token has expired. Please try again.')
+        return redirect('forgot_password')
+    
+    if request.method == 'POST':
         form = ResetPasswordForm(request.POST)
         if form.is_valid():
             new_password = form.cleaned_data['new_password']
             user.set_password(new_password)
             user.save()
             
-            # Clear token from session
-            del request.session[f'reset_token_{user_id}']
-            if f'reset_token_{user_id}_created' in request.session:
-                del request.session[f'reset_token_{user_id}_created']
+            # Delete the used token
+            reset_token.delete()
             
             messages.success(request, 'Password has been reset successfully. Please login with your new password.')
             return redirect('login')
     else:
-        from .forms import ResetPasswordForm
         form = ResetPasswordForm()
     
     return render(request, 'reset_password.html', {'form': form, 'user': user})
@@ -676,3 +911,71 @@ def admin_reset_user_password(request, user_id: int):
         return redirect('admin_user_detail', user_id=user.id)
 
     return render(request, 'admin/reset_user_password_confirm.html', {'obj_user': user})
+
+
+@staff_member_required
+def payment_analytics_dashboard(request):
+    """Analytics dashboard showing payment metrics and trends."""
+    from django.db.models import Q, Sum, Avg
+    from datetime import timedelta
+    
+    # Get metrics for different time ranges
+    def get_metrics(days):
+        start_date = timezone.now() - timedelta(days=days)
+        orders = Order.objects.filter(created_at__gte=start_date)
+        
+        total = orders.count()
+        paid = orders.filter(status=Order.STATUS_PAID).count()
+        failed = orders.filter(status=Order.STATUS_FAILED).count()
+        revenue = float(orders.filter(status=Order.STATUS_PAID).aggregate(Sum('total_amount'))['total_amount__sum'] or 0)
+        avg_amount = float(orders.filter(status=Order.STATUS_PAID).aggregate(Avg('total_amount'))['total_amount__avg'] or 0)
+        success_rate = round((paid / total * 100), 2) if total > 0 else 0
+        
+        return {
+            'total': total,
+            'paid': paid,
+            'failed': failed,
+            'revenue': revenue,
+            'avg_amount': avg_amount,
+            'success_rate': success_rate,
+        }
+    
+    metrics_7days = get_metrics(7)
+    metrics_30days = get_metrics(30)
+    metrics_90days = get_metrics(90)
+    
+    # Daily breakdown for chart
+    start_date = timezone.now() - timedelta(days=30)
+    daily_data = (
+        Order.objects.filter(created_at__gte=start_date)
+        .extra(select={'date': 'DATE(created_at)'})
+        .values('date')
+        .annotate(
+            transactions=Count('id'),
+            successful=Count('id', filter=Q(status=Order.STATUS_PAID)),
+            failed=Count('id', filter=Q(status=Order.STATUS_FAILED)),
+            revenue=Sum('total_amount', filter=Q(status=Order.STATUS_PAID))
+        )
+        .order_by('date')
+    )
+    
+    # Status breakdown pie chart
+    status_breakdown = {
+        'paid': Order.objects.filter(status=Order.STATUS_PAID).count(),
+        'failed': Order.objects.filter(status=Order.STATUS_FAILED).count(),
+        'pending': Order.objects.filter(status=Order.STATUS_PENDING).count(),
+    }
+    
+    # Recent transactions
+    recent_transactions = Order.objects.select_related('user').order_by('-created_at')[:20]
+    
+    context = {
+        'metrics_7days': metrics_7days,
+        'metrics_30days': metrics_30days,
+        'metrics_90days': metrics_90days,
+        'daily_data': list(daily_data),
+        'status_breakdown': status_breakdown,
+        'recent_transactions': recent_transactions,
+    }
+    
+    return render(request, 'admin/payment_analytics.html', context)

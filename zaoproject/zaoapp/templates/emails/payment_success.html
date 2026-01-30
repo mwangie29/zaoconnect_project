@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+        .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+        .header { background-color: #4CAF50; color: white; padding: 20px; text-align: center; }
+        .content { padding: 20px; border: 1px solid #ddd; }
+        .details { background-color: #f9f9f9; padding: 15px; border-left: 4px solid #4CAF50; margin: 15px 0; }
+        .footer { text-align: center; padding: 20px; color: #666; font-size: 12px; }
+        .success-badge { background-color: #4CAF50; color: white; padding: 10px 20px; border-radius: 5px; display: inline-block; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>✓ Payment Successful</h1>
+        </div>
+        
+        <div class="content">
+            <p>Dear {{ user_name }},</p>
+            
+            <p>Thank you for your payment! We have successfully received your payment for your order.</p>
+            
+            <div class="details">
+                <h3>Payment Details</h3>
+                <p><strong>Order ID:</strong> {{ order_id }}</p>
+                <p><strong>Amount Paid:</strong> KES {{ amount }}</p>
+                <p><strong>M-Pesa Receipt:</strong> {{ receipt_number }}</p>
+                <p><strong>Phone Number:</strong> {{ phone_number }}</p>
+                <p><strong>Date & Time:</strong> {{ created_at }}</p>
+            </div>
+            
+            <p>Your order is being processed and will be fulfilled shortly. You will receive another email with shipping details soon.</p>
+            
+            <p>If you have any questions, please don't hesitate to contact our customer support team.</p>
+            
+            <p>Best regards,<br>
+            The {{ site_name }} Team</p>
+        </div>
+        
+        <div class="footer">
+            <p>This is an automated email. Please do not reply to this email.</p>
+            <p>&copy; 2026 {{ site_name }}. All rights reserved.</p>
+        </div>
+    </div>
+</body>
+</html>

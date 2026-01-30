@@ -10,6 +10,7 @@
       <div class="card shadow-sm">
         <div class="card-body">
           <form id="checkout-form">
+            {% csrf_token %}
             <!-- Country Selection -->
             <div class="mb-4">
               <label for="country-select" class="form-label fw-semibold">Country</label>
@@ -35,9 +36,9 @@
               <small class="text-muted">Top counties in the selected country</small>
             </div>
 
-            <!-- Mobile Number -->
+            <!-- Mobile Number (country code + exactly 9 digits for M-Pesa) -->
             <div class="mb-4">
-              <label for="mobile-number" class="form-label fw-semibold">Mobile Number</label>
+              <label class="form-label fw-semibold">Mobile Number</label>
               <div class="input-group input-group-lg">
                 <span class="input-group-text fw-semibold" id="country-code">+254</span>
                 <input 
@@ -45,10 +46,13 @@
                   class="form-control" 
                   id="mobile-number" 
                   placeholder="712345678"
-                  pattern="[0-9]{9,10}"
+                  maxlength="9"
+                  pattern="[0-9]{9}"
+                  inputmode="numeric"
                   required>
               </div>
-              <small class="text-muted">Enter 9-10 digit mobile number without country code</small>
+              <small class="text-muted">Enter exactly 9 digits (no country code)</small>
+              <div class="invalid-feedback" id="mobile-error">Enter 9 digits only.</div>
             </div>
 
             <!-- Delivery Address -->
@@ -61,13 +65,20 @@
                 placeholder="Enter your specific delivery address (e.g., street, building number, landmarks)"></textarea>
             </div>
 
-            <div class="d-flex gap-2">
-              <button type="submit" class="btn btn-primary btn-lg flex-grow-1">
-                Proceed to Payment
+            <hr class="my-4">
+            <h5 class="mb-3">Payment Method</h5>
+            <div class="mb-4">
+              <div class="form-check border rounded p-3 mb-2">
+                <input class="form-check-input" type="radio" name="payment-method" id="pay-mpesa" value="mpesa" checked>
+                <label class="form-check-label fw-semibold" for="pay-mpesa">M-Pesa</label>
+                <p class="small text-muted mb-0 ms-4">You will receive an STK push on the number above. Enter your M-PESA PIN on your phone to complete payment.</p>
+              </div>
+            </div>
+            <div class="d-flex gap-2 flex-wrap">
+              <button type="button" class="btn btn-success btn-lg flex-grow-1" id="pay-now-btn">
+                Pay Now (M-Pesa)
               </button>
-              <a href="{% url 'cart' %}" class="btn btn-outline-secondary btn-lg">
-                Back to Cart
-              </a>
+              <a href="{% url 'cart' %}" class="btn btn-outline-secondary btn-lg">Back to Cart</a>
             </div>
           </form>
         </div>
@@ -102,7 +113,7 @@
           </div>
 
           <div class="alert alert-info small mb-0">
-            <strong>Note:</strong> You will be able to review and confirm your order on the next page before making payment.
+            <strong>Note:</strong> Check your cart total above. Use <strong>Pay Now</strong> to receive an M-Pesa STK push on your phone.
           </div>
         </div>
       </div>
@@ -110,10 +121,15 @@
   </div>
 </div>
 
-<script>
-  // Cart storage key
-  const cartStorageKey = 'zaoconnect_cart';
+<!-- Success / error notification (hidden by default) -->
+<div id="payment-notification" class="position-fixed top-0 start-50 translate-middle-x mt-3" style="z-index: 9999; display: none;">
+  <div id="payment-notification-inner" class="alert alert-dismissible fade show" role="alert">
+    <span id="payment-notification-text"></span>
+    <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+  </div>
+</div>
 
+<script>
   // East African countries and their counties
   const countriesData = {
     KE: {
@@ -235,64 +251,65 @@
     return 'Ksh.' + parseFloat(value).toFixed(2);
   }
 
-  // Load cart from localStorage
-  function loadCartFromStorage() {
-    try {
-      const stored = localStorage.getItem(cartStorageKey);
-      return stored ? JSON.parse(stored) : {};
-    } catch (e) {
-      console.error('Error loading cart from localStorage:', e);
-      return {};
-    }
+  function getCsrfToken() {
+    const el = document.querySelector('[name=csrfmiddlewaretoken]');
+    if (el) return el.value;
+    const cookie = document.cookie.match(/csrftoken=([^;]+)/);
+    return cookie ? cookie[1].trim() : '';
   }
 
-  // Display order summary
-  function displayOrderSummary() {
-    const cart = loadCartFromStorage();
+  // Cart data from backend (set by loadOrderSummary)
+  let cartData = { items: [], total: 0 };
+
+  // Load cart from backend and display order summary
+  function loadOrderSummary() {
     const container = document.getElementById('order-items-summary');
     const subtotalEl = document.getElementById('summary-subtotal');
     const shippingEl = document.getElementById('summary-shipping');
     const totalEl = document.getElementById('summary-total');
 
-    if (Object.keys(cart).length === 0) {
-      container.innerHTML = `
-        <div class="alert alert-warning">
-          <p class="mb-0">Your cart is empty. <a href="{% url 'index' %}">Continue shopping</a></p>
-        </div>
-      `;
-      return;
-    }
+    fetch('{% url "get_cart" %}')
+      .then(function(res) { if (!res.ok) throw new Error('Failed to load cart'); return res.json(); })
+      .then(function(data) {
+        cartData = data;
+        const items = data.items || [];
+        const subtotal = data.total || 0;
+        const shippingCost = items.length > 0 ? 200 : 0;
+        const total = subtotal + shippingCost;
 
-    // Build items list
-    let html = '<div class="mb-3">';
-    let subtotal = 0;
+        if (items.length === 0) {
+          container.innerHTML = '<div class="alert alert-warning"><p class="mb-0">Your cart is empty. <a href="{% url "index" %}">Continue shopping</a></p></div>';
+          subtotalEl.textContent = formatMoney(0);
+          shippingEl.textContent = formatMoney(0);
+          totalEl.textContent = formatMoney(0);
+          return;
+        }
 
-    for (const productId in cart) {
-      const item = cart[productId];
-      const lineTotal = item.price * item.qty;
-      subtotal += lineTotal;
+        let html = '<div class="mb-3">';
+        items.forEach(function(item) {
+          const lineTotal = item.price * item.quantity;
+          html += '<div class="d-flex justify-content-between mb-2 small"><div><span class="text-dark">' + item.name + '</span><br><span class="text-muted">×' + item.quantity + '</span></div><span class="fw-semibold">' + formatMoney(lineTotal) + '</span></div>';
+        });
+        html += '</div>';
+        container.innerHTML = html;
+        subtotalEl.textContent = formatMoney(subtotal);
+        shippingEl.textContent = formatMoney(shippingCost);
+        totalEl.textContent = formatMoney(total);
+      })
+      .catch(function(err) {
+        console.error('Error loading cart:', err);
+        container.innerHTML = '<div class="alert alert-danger"><p class="mb-0">Could not load cart. <a href="{% url "cart" %}">Back to cart</a></p></div>';
+      });
+  }
 
-      html += `
-        <div class="d-flex justify-content-between mb-2 small">
-          <div>
-            <span class="text-dark">${item.name}</span><br>
-            <span class="text-muted">×${item.qty}</span>
-          </div>
-          <span class="fw-semibold">${formatMoney(lineTotal)}</span>
-        </div>
-      `;
-    }
-
-    html += '</div>';
-    container.innerHTML = html;
-
-    // Update totals
-    const shippingCost = 200;
-    const total = subtotal + shippingCost;
-
-    subtotalEl.textContent = formatMoney(subtotal);
-    shippingEl.textContent = formatMoney(shippingCost);
-    totalEl.textContent = formatMoney(total);
+  function showNotification(msg, isSuccess) {
+    var el = document.getElementById('payment-notification');
+    var inner = document.getElementById('payment-notification-inner');
+    var text = document.getElementById('payment-notification-text');
+    inner.className = 'alert alert-dismissible fade show ' + (isSuccess ? 'alert-success' : 'alert-danger');
+    text.textContent = msg;
+    el.style.display = 'block';
+    setTimeout(function() { el.style.display = 'none'; }, 8000);
   }
 
   // Update counties based on selected country
@@ -321,71 +338,99 @@
     }
   }
 
-  // Handle form submission
+  // Prevent form submit (we use Pay Now only)
   document.getElementById('checkout-form').addEventListener('submit', function(e) {
     e.preventDefault();
+  });
 
-    const countrySelect = document.getElementById('country-select');
-    const countySelect = document.getElementById('county-select');
-    const mobileNumber = document.getElementById('mobile-number');
-    const deliveryAddress = document.getElementById('delivery-address');
-
-    const country = countrySelect.value;
-    const county = countySelect.value;
-    const mobile = mobileNumber.value;
-    const address = deliveryAddress.value;
-
-    // Validate
-    if (!country || !county || !mobile) {
-      alert('Please fill in all required fields (Country, County, Mobile Number)');
+  // Pay Now: M-Pesa STK Push then poll for result
+  document.getElementById('pay-now-btn').addEventListener('click', function() {
+    var btn = this;
+    var mobileInput = document.getElementById('mobile-number');
+    var raw = (mobileInput.value || '').replace(/\D/g, '');
+    if (raw.length !== 9) {
+      mobileInput.classList.add('is-invalid');
+      showNotification('Please enter exactly 9 digits for your M-Pesa number.', false);
       return;
     }
-
-    // Get full mobile number with country code
-    const countryData = countriesData[country];
-    const fullMobileNumber = countryData.code + mobile;
-
-    // Store order information
-    const orderInfo = {
-      country: countryData.name,
-      countryCode: country,
-      county: county,
-      mobileNumber: fullMobileNumber,
-      deliveryAddress: address,
-      timestamp: new Date().toISOString()
-    };
-
-    try {
-      localStorage.setItem('zaoconnect_order', JSON.stringify(orderInfo));
-      console.log('Order information saved:', orderInfo);
-      
-      // Show success and redirect
-      alert(`✓ Delivery information saved!\n\nCountry: ${orderInfo.country}\nCounty: ${county}\nMobile: ${fullMobileNumber}\n\nPayment page coming soon!`);
-    } catch (e) {
-      console.error('Error saving order information:', e);
-      alert('Error saving delivery information. Please try again.');
+    mobileInput.classList.remove('is-invalid');
+    var countryCodeSpan = document.getElementById('country-code');
+    var countryCode = (countryCodeSpan.textContent || '+254').replace(/\D/g, '') || '254';
+    var phone_number = countryCode + raw;
+    var amount = Math.round(parseFloat(cartData.total));
+    if (!amount || amount < 1) {
+      showNotification('Your cart is empty. Add items before paying.', false);
+      return;
     }
+    btn.disabled = true;
+    btn.textContent = 'Sending STK Push...';
+    fetch('{% url "initiate_stk_push" %}', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCsrfToken() },
+      body: JSON.stringify({ phone_number: phone_number, amount: amount })
+    })
+      .then(function(r) { return r.json().then(function(data) { return { ok: r.ok, data: data }; }); })
+      .then(function(result) {
+        if (!result.ok || !result.data.success) {
+          btn.disabled = false;
+          btn.textContent = 'Pay Now (M-Pesa)';
+          showNotification(result.data.error || 'Could not send STK push.', false);
+          return;
+        }
+        var checkoutRequestId = result.data.checkout_request_id;
+        btn.textContent = 'Check your phone for M-Pesa prompt...';
+        var pollCount = 0;
+        var maxPoll = 60;
+        function poll() {
+          pollCount++;
+          fetch('{% url "payment_status" "CHECKOUT_ID" %}'.replace('CHECKOUT_ID', encodeURIComponent(checkoutRequestId)))
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+              if (data.status === 'paid') {
+                btn.disabled = false;
+                btn.textContent = 'Pay Now (M-Pesa)';
+                showNotification('Payment successful! Receipt: ' + (data.receipt_number || 'N/A') + '. Thank you for your order.', true);
+                loadOrderSummary();
+                return;
+              }
+              if (data.status === 'failed' || pollCount >= maxPoll) {
+                btn.disabled = false;
+                btn.textContent = 'Pay Now (M-Pesa)';
+                showNotification(data.status === 'failed' ? 'Payment was not completed. You can try again.' : 'Timed out waiting for payment. Check your phone or try again.', false);
+                return;
+              }
+              setTimeout(poll, 3000);
+            })
+            .catch(function() {
+              if (pollCount >= maxPoll) {
+                btn.disabled = false;
+                btn.textContent = 'Pay Now (M-Pesa)';
+                showNotification('Could not verify payment. Check your phone or orders.', false);
+              } else {
+                setTimeout(poll, 3000);
+              }
+            });
+        }
+        setTimeout(poll, 4000);
+      })
+      .catch(function(err) {
+        console.error(err);
+        btn.disabled = false;
+        btn.textContent = 'Pay Now (M-Pesa)';
+        showNotification('Network error. Please try again.', false);
+      });
+  });
+
+  // Restrict mobile input to digits only and max 9
+  document.getElementById('mobile-number').addEventListener('input', function() {
+    this.value = this.value.replace(/\D/g, '').slice(0, 9);
   });
 
   // Initialize
   document.addEventListener('DOMContentLoaded', function() {
-    // Check if cart exists
-    const cart = loadCartFromStorage();
-    if (Object.keys(cart).length === 0) {
-      const confirmRedirect = confirm('Your cart is empty. Go back to shopping?');
-      if (confirmRedirect) {
-        window.location.href = '{% url "index" %}';
-      }
-    }
-
-    // Display order summary
-    displayOrderSummary();
-
-    // Set default country to Kenya
+    loadOrderSummary();
     document.getElementById('country-select').value = 'KE';
     updateCounties();
-
-    // Add event listener for country selection
     document.getElementById('country-select').addEventListener('change', updateCounties);
   });
 </script>

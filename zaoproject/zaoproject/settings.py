@@ -10,10 +10,22 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
+import os
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Load .env if present (no extra package required)
+_env_path = BASE_DIR / '.env'
+if _env_path.exists():
+    with open(_env_path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                k, _, v = line.partition('=')
+                k, v = k.strip(), v.strip().strip('"').strip("'")
+                os.environ.setdefault(k, v)
 
 
 # Quick-start development settings - unsuitable for production
@@ -126,7 +138,7 @@ USE_TZ = True
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/5.2/howto/static-files/
 
-STATIC_URL = 'static/'
+STATIC_URL = '/static/'
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 
@@ -134,3 +146,35 @@ MEDIA_ROOT = BASE_DIR / 'media'
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# -----------------------------------------------------------------------------
+# M-Pesa Daraja API (STK Push / Lipa Na M-Pesa Online)
+# Use .env for production; defaults below are for development only.
+# https://developer.safaricom.co.ke/
+# -----------------------------------------------------------------------------
+MPESA_ENV = os.environ.get('MPESA_ENV', 'sandbox')  # 'sandbox' or 'production'
+MPESA_CONSUMER_KEY = os.environ.get(
+    'MPESA_CONSUMER_KEY',
+    '1YMNybjGtg6QREzaCbGoDcQe4GNBl4Ajk15N4l6prshZCxtI',
+)
+MPESA_CONSUMER_SECRET = os.environ.get(
+    'MPESA_CONSUMER_SECRET',
+    'JePwiJlnQ8HZIC4XL3tXA7sU94slYN1efnoCgEdsZsCX9yvPRhKbeh1Dl0z1ZWJi',
+)
+# Lipa Na M-Pesa Online: Shortcode (Paybill or Till) and Passkey from Daraja portal
+MPESA_SHORTCODE = os.environ.get('MPESA_SHORTCODE', '174379')
+MPESA_PASSKEY = os.environ.get(
+    'MPESA_PASSKEY',
+    'bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919',
+)
+# Callback host: your public URL (e.g. ngrok) so Daraja can POST payment result. No trailing slash.
+MPESA_CALLBACK_HOST = os.environ.get('MPESA_CALLBACK_HOST', '')
+
+# Email Configuration
+EMAIL_BACKEND = os.environ.get('EMAIL_BACKEND', 'django.core.mail.backends.console.EmailBackend')
+EMAIL_HOST = os.environ.get('EMAIL_HOST', 'smtp.gmail.com')
+EMAIL_PORT = int(os.environ.get('EMAIL_PORT', '587'))
+EMAIL_USE_TLS = os.environ.get('EMAIL_USE_TLS', 'True') == 'True'
+EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')
+EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
+DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'noreply@zaoconnect.com')

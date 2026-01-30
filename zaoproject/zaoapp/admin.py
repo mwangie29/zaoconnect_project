@@ -1,5 +1,6 @@
 from django.contrib import admin
 from django.utils.html import format_html
+from django.conf import settings
 
 from .models import Contact, Product, Cart, CartItem
 
@@ -15,13 +16,15 @@ class ProductAdmin(admin.ModelAdmin):
 
     def image_thumb(self, obj):
         if obj.image:
-            return format_html('<img src="{}" style="width:48px;height:48px;object-fit:cover;border-radius:4px;" />', obj.image.url)
+            image_url = f"{settings.MEDIA_URL}{obj.image}"
+            return format_html('<img src="{}" style="width:48px;height:48px;object-fit:cover;border-radius:4px;" />', image_url)
         return '—'
     image_thumb.short_description = 'Image'
 
     def image_preview(self, obj):
         if obj.image:
-            return format_html('<img src="{}" style="max-width:200px;border-radius:8px;" />', obj.image.url)
+            image_url = f"{settings.MEDIA_URL}{obj.image}"
+            return format_html('<img src="{}" style="max-width:200px;border-radius:8px;" />', image_url)
         return 'No image uploaded'
     image_preview.short_description = 'Preview'
 

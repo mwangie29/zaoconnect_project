@@ -53,11 +53,20 @@
     return 'Ksh.' + parseFloat(value).toFixed(2);
   }
 
-  // Load cart from backend API
+  // Load cart from backend API (persisted per user in DB — survives refresh and re-login)
   function loadCart() {
     fetch('{% url "get_cart" %}')
-      .then(response => response.json())
-      .then(data => displayCartItems(data))
+      .then(function(response) {
+        if (response.status === 401 || response.status === 403) {
+          window.location.href = '{% url "login" %}?next={% url "cart" %}';
+          return null;
+        }
+        if (!response.ok) throw new Error('Failed to load cart');
+        return response.json();
+      })
+      .then(function(data) {
+        if (data) displayCartItems(data);
+      })
       .catch(error => console.error('Error loading cart:', error));
   }
 

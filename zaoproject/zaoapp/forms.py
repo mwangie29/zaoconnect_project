@@ -2,6 +2,7 @@ from django.contrib.auth.forms import UserCreationForm, PasswordChangeForm
 from django.contrib.auth.models import User
 from django import forms
 from django.core.exceptions import ValidationError
+from email_validator import validate_email, EmailNotValidError
 
 from .models import Product
 
@@ -53,8 +54,17 @@ class Registerform(forms.ModelForm):
 
     def clean_email(self):
         email = self.cleaned_data.get("email")
+        
+        # Validate email format and check if it exists
+        try:
+            validate_email(email)  # Checks if email format is valid and mailbox exists
+        except EmailNotValidError as e:
+            raise ValidationError(f"Invalid email: {str(e)}")
+        
+        # Check if email is already registered
         if User.objects.filter(email=email).exists():
             raise ValidationError("This email is already registered.")
+        
         return email
 
     def save(self, commit=True):
@@ -138,6 +148,29 @@ class ForgotPasswordForm(forms.Form):
         if not User.objects.filter(email=email).exists():
             raise ValidationError('No account found with this email address.')
         return email
+
+
+class VerifyResetCodeForm(forms.Form):
+    """Form to verify the 6-digit code sent to email."""
+    
+    code = forms.CharField(
+        max_length=6,
+        min_length=6,
+        required=True,
+        widget=forms.TextInput(attrs={
+            'class': 'form-control text-center',
+            'placeholder': '000000',
+            'style': 'letter-spacing: 8px; font-size: 24px; font-weight: bold;',
+            'inputmode': 'numeric',
+        }),
+        label='Verification Code'
+    )
+    
+    def clean_code(self):
+        code = self.cleaned_data.get('code')
+        if not code.isdigit():
+            raise ValidationError('Code must contain only digits.')
+        return code
 
 
 class ResetPasswordForm(forms.Form):
